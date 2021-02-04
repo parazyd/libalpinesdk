@@ -1,0 +1,56 @@
+#!/usr/bin/env zsh
+# shellcheck shell=bash
+# Copyright (c) 2016-2021 Ivan J. <parazyd@dyne.org>
+# This file is part of libalpinesdk
+#
+# This source code is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This software is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this source code. If not, see <http://www.gnu.org/licenses/>.
+
+vars+=(release version mirror rootfs_mirror section blend_name image_name vm_name)
+vars+=(arch earch)
+vars+=(usercredentials rootcredentials)
+vars+=(COMPRESS_IMAGE CPIO_STAGE4 MKEFI)
+
+arrs+=(core_packages base_packages purge_packages blend_packages)
+arrs+=(core_packages_option base_packages_option purge_packages_option blend_packages_option)
+
+os="alpine"
+release="edge"
+version="3.13"
+minversion="${version}.1"
+mirror="https://nl.alpinelinux.org/alpine"
+rootfs_mirror="https://dl-cdn.alpinelinux.org"
+section="main community testing"
+
+image_name="${os}_${release}_${version}_${arch}"
+[[ -n "$blend_name"  ]] && image_name="${image_name}_${blend_name}"
+[[ -n "$device_name" ]] && image_name="${image_name}_${device_name}"
+
+vm_name="${os}_${release}_${version}_${arch}_virtual"
+[[ -n "$blend_name" ]] && vm_name="${vm_name}_${blend_name}"
+
+rootcredentials="root:toor"
+
+core_packages_option=()
+core_packages=(
+	alpine-base
+	alpine-keys
+)
+
+base_packages_option=()
+base_packages=(
+	openssh
+)
+
+purge_packages_option=()
+purge_packages+=()

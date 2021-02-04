@@ -1,0 +1,352 @@
+#!/usr/bin/env zsh
+# shellcheck shell=bash
+# Copyright (c) 2016-2021 Ivan J. <parazyd@dyne.org>
+# This file is part of libalpinesdk
+#
+# This source code is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This software is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this source code. If not, see <http://www.gnu.org/licenses/>.
+
+vars+=(bootpart rootpart loopdevice)
+
+strapdir_to_image()
+{
+	fn strapdir_to_image
+	req=(workdir strapdir bootpart rootpart loopdevice)
+	ckreq || return 1
+
+	notice "Copying strapdir to image ..."
+
+	if [[ ! -d "$workdir/mnt" ]]; then
+		die "$workdir/mnt doesn't exist. Did you run image_mount?"
+		zerr; return 1
+	fi
+
+	pushd "$strapdir"
+	sudo find . \
+		-not -path "./dev/*" \
+		-a -not -path "./proc/*" \
+		-a -not -path "./sys/*" \
+		| sudo cpio -adm -p "$workdir/mnt" || { zerr; return 1; }
+	popd
+}
+
+image_prepare_raw()
+{
+	fn image_prepare_raw
+	req=(workdir size image_name)
+	ckreq || return 1
+
+	notice "Creating raw image of $size MB"
+	touch "$workdir/${image_name}.img"
+	chattr +C "$workdir/${image_name}.img"
+	dd if=/dev/zero of="$workdir/${image_name}.img" bs=1M count="$size" || { zerr; return 1; }
+}
+
+image_prepare_qcow2()
+{
+	fn image_prepare_qcow2
+	req=(workdir size image_name)
+	ckreq || return 1
+
+	notice "Creating qcow2 image of $size MB"
+	touch "$workdir/${image_name}.qcow2"
+	chattr +C "$workdir/${image_name}.qcow2"
+	qemu-img create -f qcow2 "${workdir}/${image_name}.qcow2" "${size}M" || { zerr; return 1; }
+}
+
+image_format_partitions()
+{
+	fn image_format_partitions
+	req=(bootfs bootpart rootpart)
+	ckreq || return 1
+
+	notice "Formatting image partitions"
+
+	case "$bootfs" in
+	none)
+		act "Skipping boot partition"
+		;;
+	vfat|fat|dos)
+		act "Formatting boot as VFAT"
+		sudo mkfs.vfat ${=bootopts} "${bootpart}" || { zerr; return 1; }
+		;;
+	ext?)
+		act "Formatting boot as $bootfs"
+		sudo mkfs.${bootfs} ${=bootopts} "${bootpart}" || { zerr; return 1; }
+		;;
+	btrfs)
+		act "Formatting boot as btrfs"
+		sudo mkfs.btrfs ${=bootopts} "${bootpart}" || { zerr; return 1; }
+		;;
+	"")
+		die "No bootfs filesystem set!"
+		zerr; return 1
+		;;
+	*)
+		die "Unimplemented filesystem: $bootfs"
+		die "Please report it for inclusion."
+		zerr; return 1
+		;;
+	esac
+
+	case "$rootfs" in
+	none)
+		act "Skipping root partition"
+		;;
+	vfat|fat|dos)
+		act "Formatting root as VFAT"
+		sudo mkfs.vfat ${=rootopts} "${rootpart}" || { zerr; return 1; }
+		;;
+	ext?)
+		act "Formatting root as $rootfs"
+		sudo mkfs.${rootfs} ${=rootopts} "${rootpart}" || { zerr; return 1; }
+		;;
+	btrfs)
+		act "Formatting root as btrfs"
+		sudo mkfs.btrfs ${=rootopts} "${rootpart}" || { zerr; return 1; }
+		;;
+	"")
+		die "No rootfs filesystem set!"
+		zerr; return 1
+		;;
+	*)
+		die "Unimplemented filesystem: $rootfs"
+		die "Please report it for inclusion."
+		zerr; return 1
+		;;
+	esac
+}
+
+image_connect_raw()
+{
+	fn image_connect_raw
+	req=(workdir image_name)
+	ckreq || return 1
+
+	notice "Connecting raw image to loop device"
+
+	loopdevice="$(findloopdev)"
+	if [[ -z "$loopdevice" ]]; then
+		die "Didn't find a free loop device"
+		zerr; return 1
+	fi
+
+	bootpart="${loopdevice}p1"
+	rootpart="${loopdevice}p2"
+}
+
+image_connect_qcow2()
+{
+	fn image_connect_qcow2
+	req=(workdir image_name)
+	ckreq || return 1
+
+	notice "Connecting qcow2 image to nbd device"
+
+	sudo modprobe nbd max_part=8 || { zerr; return 1; }
+	loopdevice="$(findnbddev)"
+	if [[ -z "$loopdevice" ]]; then
+		die "Didn't find a free nbd device"
+		zerr; return 1
+	fi
+
+	sudo qemu-nbd --connect="${loopdevice}" "$workdir/${image_name}.qcow2" || { zerr; return 1; }
+}
+
+image_partition_dos()
+{
+	fn image_partition_dos
+	req=(loopdevice bootpart rootpart dos_boot dos_root)
+	ckreq || return 1
+
+	notice "Partitioning dos image"
+
+	sudo parted "$loopdevice" --script -- mklabel msdos || { zerr; return 1; }
+	sudo parted "$loopdevice" --script -- mkpart primary "$dos_boot" || { zerr; return 1; }
+	sudo parted "$loopdevice" --script -- mkpart primary "$dos_root" || { zerr; return 1; }
+	if [[ -n "$bootable_part" ]]; then
+		sudo parted "$loopdevice" --script -- set "$bootable_part" boot on
+	fi
+
+	sudo partprobe "$loopdevice" || { zerr; return 1; }
+}
+
+image_mount()
+{
+	fn image_mount
+	req=(workdir bootpart rootpart bootfs)
+	ckreq || return 1
+
+	notice "Mounting image to $workdir/mnt"
+
+	mkdir -p "$workdir/mnt"
+	sudo mount "$rootpart" "$workdir/mnt" || { zerr; return 1; }
+	act "Mounted root partition"
+
+	if [[ "$bootfs" = none ]]; then
+		return
+	fi
+
+	sudo mkdir -p "$workdir/mnt/boot"
+	sudo mount "$bootpart" "$workdir/mnt/boot" || { zerr; return 1; }
+	act "Mounted boot partition"
+}
+
+image_umount()
+{
+	fn image_umount
+	req=(workdir bootpart rootpart)
+	ckreq || return 1
+
+	notice "Umounting image from $workdir/mnt"
+
+	sudo umount -R "$workdir/mnt" || { zerr; return 1; }
+	act "Umounted"
+
+	act "Flushing bytes and buffers"
+	sudo blockdev --flushbufs "$loopdevice" || { zerr; return 1; }
+	sudo python -c 'import os; os.fsync(open("'$loopdevice'", "r+b"))' || { zerr; return 1; }
+}
+
+image_disconnect_raw()
+{
+	fn image_disconnect_raw
+	req=(loopdevice bootfs rootfs bootpart rootpart)
+	ckreq || return 1
+
+	notice "Disconnecting image from $loopdevice"
+
+	act "Rechecking filesystems"
+	case "$bootfs" in
+	ext?)
+		sudo e2fsck -fy "$bootpart"
+		sudo resize2fs "$bootpart"
+		;;
+	esac
+
+	case "$rootfs" in
+	ext?)
+		sudo e2fsck -fy "$rootpart"
+		sudo resize2fs "$rootpart"
+		;;
+	esac
+
+	act "Disconnecting"
+	sudo partx -dv "$loopdevice" || {
+		die "partx failed to remove $loopdevice"
+		zerr; return 1
+	}
+
+	sudo losetup -d "$loopdevice" || {
+		die "losetup failed to remove $loopdevice"
+		zerr; return 1
+	}
+}
+
+image_disconnect_qcow2()
+{
+	fn image_disconnect_qcow2
+	req=(loopdevice bootfs rootfs bootpart rootpart)
+	ckreq || return 1
+
+	notice "Disconnecting image from $loopdevice"
+
+	act "Rechecking filesystems"
+	case "$bootfs" in
+	ext?)
+		sudo e2fsck -fy "$bootpart"
+		sudo resize2fs "$bootpart"
+		;;
+	esac
+
+	case "$rootfs" in
+	ext?)
+		sudo e2fsck -fy "$rootpart"
+		sudo resize2fs "$rootpart"
+		;;
+	esac
+
+	act "Disconnecting"
+
+	sudo qemu-nbd --disconnect "$loopdevice" || { zerr; return 1; }
+}
+
+image_raw_to_qcow2()
+{
+	fn image_raw_to_qcow2
+	req=(image_name workdir)
+	ckreq || return 1
+
+	notice "Converting raw image to qcow2"
+	pushd "$workdir" || { zerr; return 1; }
+	touch "${image_name}.qcow2"
+	chattr +C "${image_name}.qcow2"
+	qemu-img convert -f raw -O qcow2 "${image_name}.img" "${image_name}.qcow2" || { zerr; return 1; }
+	popd
+}
+
+image_raw_to_vdi()
+{
+	fn image_raw_to_vdi
+	req=(image_name workdir)
+	ckreq || return 1
+
+	notice "Converting raw image to vdi"
+	pushd "$workdir" || { zerr; return 1; }
+	touch "${image_name}.vdi"
+	chattr +C "${image_name}.vdi"
+	qemu-img convert -f raw -O vdi "${image_name}.img" "${image_name}.vdi" || { zerr; return 1; }
+	#VBoxManage modifyhd "${image_name}.vdi" --type immutable --compact || { zerr; return 1; }
+	popd
+}
+
+image_pack_dist()
+{
+	fn image_pack_dist
+	req=(R image_name workdir)
+	ckreq || return 1
+
+	notice "Packing up built images"
+
+	local _xzcomp=""
+	local _rsuffix="img"
+
+	if [[ -n "$COMPRESS_IMAGE" ]]; then
+		if command -v pixz >/dev/null; then
+			_xzcomp="$(command -v pixz)"
+		else
+			_xzcomp="$(command -v xz)"
+		fi
+		_rsuffix="img.xz"
+	fi
+
+	pushd "$workdir" || { zerr; return 1; }
+
+	if [[ -n "$COMPRESS_IMAGE" ]]; then
+		act "Compressing images with $_xzcomp"
+		silly
+		$_xzcomp "${image_name}.img" || { zerr; return 1; }
+		# TODO: cpio image?
+	fi
+
+	act "Calculating sha256 checksums"
+	silly
+	sha256sum "${image_name}.${_rsuffix}" > "${image_name}.${_rsuffix}.sha256"
+	# TODO: cpio image?
+	mkdir -p "$R/dist"
+	mv -v "${image_name}".* "$R/dist" || { zerr; return 1; }
+
+	notice "Done! Thanks for being patient!"
+
+	popd
+}

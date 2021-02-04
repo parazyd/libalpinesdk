@@ -1,0 +1,111 @@
+#!/usr/bin/env zsh
+# shellcheck shell=bash
+# Copyright (c) 2016-2021 Ivan J. <parazyd@dyne.org>
+# This file is part of libalpinesdk
+#
+# This source code is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This software is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this source code. If not, see <http://www.gnu.org/licenses/>.
+
+vars+=(vmname)
+
+vm_inject_overrides()
+{
+	fn vm_inject_overrides
+	req=(strapdir bootfs rootfs bootpart rootpart)
+	ckreq || return 1
+
+	notice "Injecting rootfs overrides"
+
+	bootuuid="$(lsblk "$bootpart" -no UUID)"
+	rootuuid="$(lsblk "$rootpart" -no UUID)"
+
+	cat <<EOF | sudo tee -a "$strapdir/etc/fstab" >/dev/null
+UUID=${rootuuid} /     ${rootfs} defaults 0 1
+UUID=${bootuuid} /boot ${bootfs} defaults 0 1
+EOF
+
+	cat <<EOF | sudo tee "$strapdir/etc/local.d/sshkeygen.start" >/dev/null
+#!/bin/sh
+[ -f /etc/ssh/ssh_host_rsa_key.pub ] || ssh-keygen -A
+exit 0
+EOF
+	sudo chmod +x "$strapdir/etc/local.d/sshkeygen.start"
+
+	sudo sed -i "$strapdir/etc/ssh/sshd_config" \
+		-e 's/#PermitRootLogin .*/PermitRootLogin yes/' \
+		-e 's/PermitRootLogin .*/PermitRootLogin yes/' || { zerr; return 1; }
+}
+
+vm_setup_grub()
+{
+	fn vm_setup_grub
+	req=(workdir loopdevice bootfs)
+	ckreq || return 1
+
+	notice "Setting up grub"
+
+	cat <<EOF | sudo tee "$workdir/mnt/setupgrub" >/dev/null
+#!/bin/sh
+grub-install "${loopdevice}" || exit 1
+grub-mkconfig -o /boot/grub/grub.cfg || exit 1
+EOF
+	chroot-script -d "$workdir/mnt/setupgrub" || { zerr; return 1; }
+}
+
+vm_pack_dist()
+{
+	fn vm_pack_dist
+	req=(R workdir image_name imageformat)
+	ckreq || return 1
+
+	notice "Packing up built images"
+
+	local _xzcomp=""
+	local _rsuffix="${imageformat}"
+	local _vsuffix="vdi"
+
+	if [[ -n "$COMPRESS_IMAGE" ]]; then
+		if command -v pixz >/dev/null; then
+			_xzcomp="$(command -v pixz)"
+		else
+			_xzcomp="$(command -v xz)"
+		fi
+		_rsuffix="${imageformat}.xz"
+		_vsuffix="vdi.xz"
+	fi
+
+	pushd "$workdir" || { zerr; return 1; }
+
+	if [[ -n "$COMPRESS_IMAGE" ]]; then
+		act "Compressing images with $_xzcomp"
+		silly
+		$_xzcomp "${image_name}.${imageformat}" || { zerr; return 1; }
+		$_xzcomp "${image_name}.vdi" || { zerr; return 1; }
+	fi
+
+	if [[ "$imageformat" != raw ]]; then
+		rm -f "${image_name}.img"
+	fi
+
+	act "Calculating sha256 checksums"
+	silly
+	sha256sum "${image_name}.${_rsuffix}" > "${image_name}.${_rsuffix}.sha256"
+	sha256sum "${image_name}.${_vsuffix}" > "${image_name}.${_vsuffix}.sha256"
+
+	mkdir -p "$R/dist"
+	mv -v "${image_name}".* "$R/dist" || { zerr; return 1; }
+
+	notice "Done! Thanks for being patient!"
+
+	popd
+}

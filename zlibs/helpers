@@ -1,0 +1,273 @@
+#!/usr/bin/env zsh
+# shellcheck shell=bash
+# Copyright (c) 2016-2021 Ivan J. <parazyd@dyne.org>
+# This file is part of libalpinesdk
+#
+# This source code is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This software is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this source code. If not, see <http://www.gnu.org/licenses/>.
+
+build_arm_dist()
+{
+	fn build_arm_dist
+	req=(workdir strapdir os arch size parted_type)
+	case "$parted_type" in
+	gpt) req+=(gpt_boot gpt_root) ;;
+	dos) req+=(dos_boot dos_root) ;;
+	*) die "Unknown parted_type: $parted_type. Supported is gpt|dos."
+		zerr; return 1
+		;;
+	esac
+	ckreq || return 1
+
+	notice "Building complete Arm image(s)"
+
+	bootstrap_complete_base        || { zerr; return 1; }
+	blend_preinst                  || { zerr; return 1; }
+	image_prepare_raw              || { zerr; return 1; }
+	image_connect_raw              || { zerr; return 1; }
+	image_partition_${parted_type} || { zerr; return 1; }
+	image_format_partitions        || { zerr; return 1; }
+	build_kernel_${arch}           || { zerr; return 1; }
+	image_mount                    || { zerr; return 1; }
+	strapdir_to_image              || { zerr; return 1; }
+	blend_postinst                 || { zerr; return 1; }
+	image_umount                   || { zerr; return 1; }
+	image_disconnect_raw           || { zerr; return 1; }
+	image_pack_dist                || { zerr; return 1; }
+	clean_strapdir                 || { zerr; return 1; }
+}
+
+build_iso_dist()
+{
+	fn build_iso_dist
+	req=(workdir strapdir os arch)
+	ckreq || return 1
+
+	notice "Building complete iso image(s)"
+
+	bootstrap_complete_base || { zerr; return 1; }
+	blend_preinst           || { zerr; return 1; }
+	iso_prepare_strap       || { zerr; return 1; }
+	iso_setup_isolinux      || { zerr; return 1; }
+	iso_write_isolinux_cfg  || { zerr; return 1; }
+	blend_postinst          || { zerr; return 1; }
+	iso_squash_strap        || { zerr; return 1; }
+	iso_xorriso_build       || { zerr; return 1; }
+}
+
+build_vm_dist()
+{
+	fn build_vm_dist
+	req=(workdir strapdir os arch size imageformat parted_type)
+	case "$parted_type" in
+	gpt) req+=(gpt_boot gpt_root) ;;
+	dos) req+=(dos_boot dos_root) ;;
+	*) die "Unknown parted_type: $parted_type. Supported is gpt|dos."
+		zerr; return 1
+		;;
+	esac
+	ckreq || return 1
+
+	notice "Building complete VM image(s)"
+
+	bootstrap_complete_base        || { zerr; return 1; }
+	blend_preinst                  || { zerr; return 1; }
+	image_prepare_raw              || { zerr; return 1; }
+	image_connect_raw              || { zerr; return 1; }
+	image_partition_${parted_type} || { zerr; return 1; }
+	image_format_partitions        || { zerr; return 1; }
+	image_mount                    || { zerr; return 1; }
+	vm_inject_overrides            || { zerr; return 1; }
+	strapdir_to_image              || { zerr; return 1; }
+	vm_setup_grub                  || { zerr; return 1; }
+	blend_postinst                 || { zerr; return 1; }
+	image_umount                   || { zerr; return 1; }
+	image_disconnect_raw           || { zerr; return 1; }
+	if [[ "$imageformat" = qcow2 ]]; then
+		image_raw_to_qcow2         || { zerr; return 1; }
+	fi
+	image_raw_to_vdi               || { zerr; return 1; }
+	vm_pack_dist                   || { zerr; return 1; }
+	clean_strapdir                 || { zerr; return 1; }
+}
+
+clean_strapdir()
+{
+	fn clean_strapdir
+	req=(strapdir)
+	ckreq || return 1
+
+	if [[ "$DEBUG" = 1 ]]; then
+		return
+	fi
+
+	notice "Cleaning strapdir"
+
+	sudo rm -rf "$strapdir"
+}
+
+devprocsys()
+{
+	fn devprocsys "$*"
+	local watdo="$1"
+	local werdo="$2"
+	req=(watdo werdo)
+	ckreq || return 1
+
+	if [[ $watdo = mount ]]; then
+		sudo mount -o bind /sys     $werdo/sys     && act "mounted sys"    && \
+		sudo mount -t proc proc     $werdo/proc    && act "mounted proc"   && \
+		sudo mount -o bind /dev     $werdo/dev     && act "mounted dev"    && \
+		sudo mount -o bind /dev/pts $werdo/dev/pts && act "mounted devpts" && \
+		return 0
+	elif [[ $watdo = umount ]]; then
+		sudo umount $werdo/dev/pts  && act "umounted devpts"
+		sudo umount $werdo/dev      && act "umounted dev"
+		sudo umount $werdo/proc     && act "umounted proc"
+		sudo umount $werdo/sys      && act "umounted sys"
+		return 0
+	fi
+	zerr; return 1
+}
+
+chroot-script()
+{
+	fn chroot-script "$*"
+	req=(R workdir strapdir)
+	ckreq || return 1
+
+	mkdir -p "$R/log"
+
+	local _divert=""
+	local _path=""
+	local _script=""
+
+	case "x$1" in
+	x-d)
+		_divert=1
+		shift
+		;;
+	esac
+
+	if [[ "$(dirname "$1")" = "." ]]; then
+		_path="$strapdir"
+	else
+		_path="$(dirname "$1")"
+	fi
+
+	_script="$(basename "$1")"
+
+	if [[ -n "$_divert" ]]; then
+		devprocsys mount "$_path" || { zerr; return 1; }
+	fi
+
+	sudo sed -i "$_path/$_script" \
+		-e 's@^#!/bin/sh@&\nexport SOURCE_DATE_EPOCH=1610550434@' \
+		-e 's@^#!/bin/sh@&\nexport LC_ALL=C@' \
+		-e 's@^#!/bin/sh@&\nexport LANG=C@' \
+		-e 's@^#!/bin/sh@&\nset -x ; exec 2>/'$_script'.log@'
+
+	notice "Chrooting to execute '$_script' ..."
+	sudo chmod +x "$_path/$_script"  || { zerr; return 1; }
+	sudo chroot "$_path" "/$_script" || { zerr; return 1; }
+	sudo mv -f "$_path/${_script}.log" "$R/log/"
+
+	if [[ -n "$_divert" ]]; then
+		devprocsys umount "$_path" || { zerr; return 1; }
+	fi
+
+	sudo rm -f "$_path/$_script"
+}
+
+findloopdev()
+{
+	fn findloopdev
+	req=(workdir image_name)
+	ckreq || return 1
+
+	local _l="$(sudo losetup -f --show "$workdir/${image_name}.img")"
+	if [[ -z "$_l" ]]; then
+		zerr; return 1
+	fi
+
+	echo "$_l"
+}
+
+findnbddev()
+{
+	fn findnbddev
+
+	notice "Finding a free /dev/nbd device"
+
+	for i in $(seq 0 8); do
+		grep -q "^/dev/nbd${i}" /proc/mounts || {
+			echo "/dev/nbd${i}"
+			return
+		}
+	done
+
+	zerr; return 1
+}
+
+silly()
+{
+	fn silly "$@"
+	local arg1="$1"
+	local arg2="$2"
+	# Cheers Mailpile!
+	funneh=(
+		"do not think of purple hippos"
+		"increasing entropy & scrambling bits"
+		"indexing kittens..."
+		"patching bugs..."
+		"spinning violently around the y-axis"
+		"warming up particle accelerator"
+		"this server is powered by a lemon and two electrodes"
+		"becoming self-aware"
+		"BCC-ing ALL THE SPIES!"
+		"all of your config settings & passwords are encrypted with AES256"
+		"the most common password is 123456, hopefully yours is different"
+		"good things come to those who wait"
+		"Make Free Software and be happy"
+		"We like volcanos, do you like volcanos?"
+		"Crossing out swear words..."
+		"Informing David Cameron of suspicious ac^H^H^H ... naaah :)"
+		"Abandon all hope, ye who enter here"
+		"Compiling bullshit bingo grid..."
+		"Estimating chance of asteroid hitting Earth"
+		"Applying coupons..."
+		"Backing up the entire Internet..."
+		"Making you wait for no reason"
+		"Doing nothing"
+		"Pay no attention to the man behind the curtain"
+		"You are great just the way you are"
+		"Supplying monkeys with typewriters"
+		"Swapping time and space"
+		"Self potato"
+		"God is porco"
+		"A million hamsters are spinning their wheels right now"
+	)
+	local rnd=$(shuf -i1-$#funneh -n 1)
+	act "${funneh[$rnd]}"
+	[[ $arg1 = sleep ]] && sleep $arg2 || true
+}
+
+blend_preinst()
+{
+	fn blend_preinst "(noop)"
+}
+
+blend_postinst()
+{
+	fn blend_postinst "(noop)"
+}
